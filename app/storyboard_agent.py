@@ -15,10 +15,11 @@
 import logging
 import os
 
-import vertexai
+from google import genai
 from google.adk.agents import Agent
 from google.adk.tools import ToolContext
-from vertexai.preview.vision_models import ImageGenerationModel
+from google.cloud import storage
+from google.genai import types
 
 from .utils.utils import load_prompt_from_file
 
@@ -28,32 +29,21 @@ logger.setLevel(logging.DEBUG)
 
 # Configuration constants
 MODEL = "gemini-2.5-flash"
+IMAGE_MODEL = "gemini-2.5-flash-image"
 DESCRIPTION = (
     "Agent responsible for creating storyboards based on a screenplay and story"
 )
-
-# Initialize VertexAI and image generation model
-IMAGEN_MODEL = "imagen-4.0-ultra-generate-001"
-
-logger.debug(f"ProjectID: {os.getenv('GOOGLE_CLOUD_PROJECT')}")
-logger.debug(f"Location: {os.getenv('GOOGLE_CLOUD_LOCATION')}")
-
-vertexai.init(
-    project=os.getenv("GOOGLE_CLOUD_PROJECT"),
-    location=os.getenv("GOOGLE_CLOUD_LOCATION"),
-)
-generation_model = ImageGenerationModel.from_pretrained(IMAGEN_MODEL)
 
 
 # Storyboard generate tool
 def storyboard_generate(
     prompt: str, scene_number: int, tool_context: ToolContext
 ) -> list[str]:
-    """
-    Generate storyboard image representing the passed prompt.
+    """Generate storyboard image representing the passed prompt.
 
     Args:
-        prompt (str): A text prompt describing the storyboard image that should be generated and returned by the tool.
+        prompt (str): A text prompt describing the storyboard image that should
+          be generated and returned by the tool.
         scene_number (int): Scene number
         tool_context (): ToolContext needed by the tool
 
@@ -61,38 +51,50 @@ def storyboard_generate(
         str: Link to the image stored in GCS bucket.
     """
     try:
-        # Get session_id for the GCS_PATH
         session_id = tool_context._invocation_context.session.id
         bucket_name = os.getenv("GOOGLE_CLOUD_BUCKET_NAME")
-        GCS_PATH = f"gs://{bucket_name}/{session_id}"
-        AUTHORIZED_URI = "https://storage.mtls.cloud.google.com/"
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+        location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+        authorized_uri = "https://storage.mtls.cloud.google.com/"
 
-        # Actual image generation
         logger.info(
             f"Generating image for scene {scene_number} with prompt: {prompt}"
         )
-        response = generation_model.generate_images(
-            prompt=prompt,
-            number_of_images=1,
-            output_gcs_uri=f"{GCS_PATH}/scene_{scene_number}",
-            aspect_ratio="1:1",
-            negative_prompt="",
-            person_generation="allow_adult",
-            safety_filter_level="block_few",
-            add_watermark=True,
+
+        client = genai.Client(
+            vertexai=True,
+            project=project_id,
+            location=location,
         )
 
-        if response.images:
-            logger.info(
-                f"Generated {len(response.images)} image(s) for prompt: {prompt}"
-            )
-            return [
-                image._gcs_uri.replace("gs://", AUTHORIZED_URI)
-                for image in response.images
-            ]
+        response = client.models.generate_content(
+            model=IMAGE_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_modalities=["IMAGE", "TEXT"]
+            ),
+        )
+
+        image_bytes = None
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if part.inline_data and part.inline_data.data:
+                    image_bytes = part.inline_data.data
+                    break
+
+        if image_bytes:
+            storage_client = storage.Client(project=project_id)
+            bucket = storage_client.bucket(bucket_name)
+            blob_path = f"{session_id}/scene_{scene_number}.png"
+            blob = bucket.blob(blob_path)
+            blob.upload_from_string(image_bytes, content_type="image/png")
+
+            gcs_uri = f"gs://{bucket_name}/{blob_path}"
+            logger.info(f"Generated and saved image to {gcs_uri}")
+            return [gcs_uri.replace("gs://", authorized_uri)]
         else:
             logger.info(f"Generated no (0) images for prompt: {prompt}")
-            return []  # Return an empty list if no images
+            return []
     except Exception as e:
         logger.error(f"Error generating an image for {prompt}: {e}")
         return []
@@ -102,10 +104,9 @@ def storyboard_generate(
 storyboard_agent = None
 try:
     storyboard_agent = Agent(
-        # Using a potentially different/cheaper model for a simple task
         model=MODEL,
         name="storyboard_agent",
-        description=(DESCRIPTION),
+        description=DESCRIPTION,
         instruction=load_prompt_from_file("storyboard_agent.txt"),
         output_key="storyboard",
         tools=[storyboard_generate],
@@ -117,3 +118,4 @@ except Exception as e:
     logger.error(
         f"❌ Could not create Storyboard agent. Check API Key ({MODEL}). Error: {e}"
     )
+

@@ -35,13 +35,6 @@ VIDEO_MODEL_LOCATION = "us-central1"
 DESCRIPTION = "Agent responsible for creating videos based on a screenplay and storyboards"
 ASPECT_RATIO = "16:9"
 
-client = genai.Client(
-    vertexai=True,
-    project=os.getenv("GOOGLE_CLOUD_PROJECT"),
-    location=VIDEO_MODEL_LOCATION,
-)
-
-
 # Video generate tool
 def video_generate(
     prompt: str,
@@ -86,6 +79,12 @@ def video_generate(
             f"Generating video for prompt '{prompt}' and image '{image_link}'"
         )
 
+        client = genai.Client(
+            vertexai=True,
+            project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+            location=VIDEO_MODEL_LOCATION,
+        )
+
         operation = client.models.generate_videos(
             model=VIDEO_MODEL,
             prompt=prompt,
@@ -119,6 +118,131 @@ def video_generate(
         return []
 
 
+# Video merge tool
+def merge_scene_videos(
+    video_links: list[str],
+    tool_context: ToolContext,
+) -> str:
+    """Consolidates and stitches all generated scene video clips into a single continuous movie.
+
+    Args:
+        video_links (list[str]): List of GCS or HTTPS URLs for each generated
+          scene video clip in chronological order.
+        tool_context (): ToolContext needed by the tool.
+
+    Returns:
+        str: Authorized link to the final merged movie stored in the GCS bucket.
+    """
+    import subprocess
+    import tempfile
+    import imageio_ffmpeg
+    from google.cloud import storage
+
+    try:
+        session_id = tool_context._invocation_context.session.id
+        bucket_name = os.getenv("GOOGLE_CLOUD_BUCKET_NAME", "my-short-movies")
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+        authorized_uri = "https://storage.mtls.cloud.google.com/"
+
+        logger.info(
+            f"Merging {len(video_links)} scene video(s) into a single movie..."
+        )
+
+        storage_client = storage.Client(project=project_id)
+        bucket = storage_client.bucket(bucket_name)
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            downloaded_files = []
+            for i, link in enumerate(video_links):
+                # Standardize URI to gs:// format if needed
+                gs_link = link
+                if gs_link.startswith(authorized_uri):
+                    gs_link = gs_link.replace(authorized_uri, "gs://")
+                elif gs_link.startswith("https://storage.googleapis.com/"):
+                    gs_link = gs_link.replace("https://storage.googleapis.com/", "gs://")
+
+                if gs_link.startswith("gs://"):
+                    blob = storage.Blob.from_string(gs_link, client=storage_client)
+                else:
+                    blob = bucket.blob(f"{session_id}/{gs_link}")
+
+                local_path = os.path.join(tmpdir, f"scene_{i + 1}.mp4")
+                blob.download_to_filename(local_path)
+                downloaded_files.append(local_path)
+                logger.info(
+                    f"Downloaded scene {i + 1} to {local_path} ({os.path.getsize(local_path)} bytes)"
+                )
+
+            concat_file = os.path.join(tmpdir, "concat_list.txt")
+            with open(concat_file, "w", encoding="utf-8") as f:
+                for path in downloaded_files:
+                    f.write(f"file '{path}'\n")
+
+            merged_output = os.path.join(tmpdir, "final_movie.mp4")
+            cmd = [
+                ffmpeg_exe,
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_file,
+                "-c",
+                "copy",
+                merged_output,
+            ]
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    f"Fast copy concat failed, re-encoding: {result.stderr}"
+                )
+                cmd_reencode = [
+                    ffmpeg_exe,
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    concat_file,
+                    "-c:v",
+                    "libx264",
+                    "-c:a",
+                    "aac",
+                    merged_output,
+                ]
+                subprocess.run(
+                    cmd_reencode,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+            final_blob_path = f"{session_id}/final_movie.mp4"
+            final_blob = bucket.blob(final_blob_path)
+            final_blob.upload_from_filename(
+                merged_output, content_type="video/mp4"
+            )
+
+            final_gcs_uri = f"gs://{bucket_name}/{final_blob_path}"
+            final_url = final_gcs_uri.replace("gs://", authorized_uri)
+            logger.info(
+                f"Successfully created and uploaded final movie to {final_url}"
+            )
+            return final_url
+    except Exception as e:
+        logger.error(f"Error merging scene videos: {e}")
+        return f"Error merging videos: {e}"
+
+
 # --- Video Agent ---
 video_agent = None
 try:
@@ -129,10 +253,10 @@ try:
         description=(DESCRIPTION),
         instruction=load_prompt_from_file("video_agent.txt"),
         output_key="video",
-        tools=[video_generate],
+        tools=[video_generate, merge_scene_videos],
     )
     logger.info(f"✅ Agent '{video_agent.name}' created using model '{MODEL}'.")
 except Exception as e:
     logger.error(
-        f"❌ Could not create Storyboard agent. Check API Key ({MODEL}). Error: {e}"
+        f"❌ Could not create Video agent. Check API Key ({MODEL}). Error: {e}"
     )

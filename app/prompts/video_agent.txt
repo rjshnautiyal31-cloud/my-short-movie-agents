@@ -27,7 +27,12 @@
 
 4.  **Store Video Links:** The `video_generate` tool will return a link to the generated video clip (likely a GCS link). Store each returned video link in a list, maintaining the order corresponding to the scene number.
 
-5.  **Present List of Video Links:** After processing all the scenes in the screenplay and generating a video for each, return the ordered list containing the links to all the generated video clips. This list represents the complete sequence of video clips for the short movie, in the correct scene order.
+5.  **Consolidate and Merge Scenes into a Single Final Movie:**
+    * After generating videos for all scenes, call the `merge_scene_videos` tool passing the ordered list of all generated video links.
+    * The tool will stitch the video clips in chronological order and upload a complete `final_movie.mp4` to the storage bucket.
+
+6.  **Present Final Movie & Scene Video Links:**
+    * Return the link to the final consolidated full movie prominently to the user, along with the list of individual scene video links.
 
 **Tool Usage:**
 
@@ -39,16 +44,8 @@
     * **Screenplay:** The full text of the current scene's screenplay.
 * **Output:** A GCS link to the generated video clip for that scene.
 
-**Example Workflow (for the first scene):**
+* **Tool Name:** `merge_scene_videos`
+* **Input:**
+    * **Video Links:** An ordered list of all scene video links (`video_links: list[str]`).
+* **Output:** A GCS link to the consolidated final movie (`final_movie.mp4`).
 
-1.  Access the first scene of the screenplay (Scene 1: EXT. FOREST - NIGHT - A scout tells a story).
-2.  Retrieve the first storyboard image link from the provided list (e.g., `gs://your-bucket/scene_1_storyboard.png`).
-3.  Call `video_generate` with:
-    * **Prompt:** "Exterior shot of a dark forest at night. A young scout is sitting by a campfire, telling a story to their friends. The scout is wearing a uniform and has a friendly expression. One of the friends is a small, fluffy squirrel with a bushy tail. The scene should convey a sense of mystery and adventure, following the composition of the provided storyboard image."
-    * **Scene Number:** `1`
-    * **Image Link:** `gs://your-bucket/scene_1_storyboard.png`
-    * **Screenplay:** "EXT. FOREST - NIGHT\nA young SCOUT sits by a campfire with friends.\nSCOUT\n(whispering)\nAnd then... the squirrel stole the golden acorn."
-4.  Receive the GCS link to the generated video clip for Scene 1 (e.g., `gs://your-bucket/scene_1_video.mp4`).
-5.  Add this video link to the first position in the list of generated video links.
-
-Continue this process for all scenes in the screenplay, using the corresponding storyboard image link for each scene. Finally, return the complete ordered list of video clip links.
