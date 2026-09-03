@@ -1,199 +1,167 @@
 # Short Movie Agents
-ADK version: 1.31.1, Owner: @rsamborski
 
-Short Movie Agents demo is an ADK example showcasing a multi-agent architecture to construct end to end videos based on the user's intent. It includes agents which have a different role each:
+A collaborative multi-agent AI system built on the **Google Agent Development Kit (ADK)** and **Google Cloud Vertex AI** that guides users end-to-end through creating AI short movies—from initial concept to screenplays, storyboard images, video clips, and final movie consolidation.
 
-- [director agent](app/agent.py) - main coordinator
-- [story agent](app/story_agent.py) - creates the story
-- [screenplay agent](app/screenplay_agent.py) - generates screenplay based on the story
-- [storyboard agent](app/storyboard_agent.py) - uses context from previous agents and Imagen4 model to generate storyboards
-- [video agent](app/video_agent.py) - produces final video using Veo3
+---
 
-Diagram:
+## Architecture & Multi-Agent Workflow
 
-![Agent Diagram](assets/agent_diagram.png)
+The system is coordinated by a **Director Agent** that orchestrates specialized sub-agents through a 4-step interactive pipeline:
 
-## Changelog
+```
+[User] ──► [Director Agent] (Coordinator)
+                 │
+                 ├─► 1. [Story Agent] (Gemini 2.5 Flash) ──► Campfire Story
+                 │
+                 ├─► 2. [Screenplay Agent] (Gemini 2.5 Flash) ──► Scene-by-Scene Script
+                 │
+                 ├─► 3. [Storyboard Agent] (Gemini 2.5 Flash Image) ──► Scene PNGs (GCS)
+                 │
+                 └─► 4. [Video Agent] (Veo 3.1 + FFmpeg) ──► Scene MP4s & Final Movie (GCS)
+```
 
-See [Changelog.md](Changelog.md).
+| Agent | File | Model / Technology | Role & Responsibilities |
+|---|---|---|---|
+| **Director Agent** | [`app/agent.py`](app/agent.py) | `gemini-2.5-flash` | Main root coordinator. Guides the user step-by-step and manages asset approvals. |
+| **Story Agent** | [`app/story_agent.py`](app/story_agent.py) | `gemini-2.5-flash` | Generates short, compelling narrative concepts and campfire stories. |
+| **Screenplay Agent** | [`app/screenplay_agent.py`](app/screenplay_agent.py) | `gemini-2.5-flash` | Breaks stories into structured scenes with character descriptions, actions, and dialogue. |
+| **Storyboard Agent** | [`app/storyboard_agent.py`](app/storyboard_agent.py) | `gemini-2.5-flash-image` | Generates high-resolution storyboard images for each scene and stores them in Cloud Storage. |
+| **Video Agent** | [`app/video_agent.py`](app/video_agent.py) | `veo-3.1-generate-001` + FFmpeg | Generates scene video clips and automatically stitches them into a continuous `final_movie.mp4`. |
+
+---
 
 ## Project Structure
 
-This project is organized as follows:
-
 ```
-short-movie-agents/
-├── app/                 # Core application code
-│   ├── agent.py         # Main agent logic
-│   ├── server.py        # FastAPI Backend server
-│   └── utils/           # Utility functions and helpers
-├── Makefile             # Makefile for common commands
-├── GEMINI.md            # AI-assisted development guide
-└── pyproject.toml       # Project dependencies and configuration
+my-short-movie-agents/
+├── app/                        # Multi-agent application package
+│   ├── agent.py                # Director root agent definition
+│   ├── story_agent.py          # Story generation agent
+│   ├── screenplay_agent.py     # Screenplay generation agent
+│   ├── storyboard_agent.py     # Storyboard image generator (GenAI SDK)
+│   ├── video_agent.py          # Video generation & video merge tool
+│   ├── merge_session.py        # CLI utility to stitch past session clips
+│   ├── server.py               # FastAPI backend server
+│   ├── prompts/                # System instructions & agent prompts
+│   └── utils/                  # Helper utilities (GCS, tracing, typing)
+├── Makefile                    # Automation shortcuts (run, test, lint)
+├── GEMINI.md                   # Google ADK development guide
+├── pyproject.toml              # Dependencies and configuration
+└── .env-template               # Environment variables template
 ```
 
-## Requirements
+---
 
-Before you begin, ensure you have:
+## Requirements & Prerequisites
 
 - **Python**: 3.13+
-- **uv**: Python package manager (used for all dependency management in this project) - [Install](https://docs.astral.sh/uv/getting-started/installation/) ([add packages](https://docs.astral.sh/uv/concepts/dependencies/) with `uv add <package>`)
-- **Google Cloud SDK**: For GCP services - [Install](https://cloud.google.com/sdk/docs/install)
-- **make**: Build automation tool - [Install](https://www.gnu.org/software/make/) (pre-installed on most Unix-based systems)
+- **[uv](https://docs.astral.sh/uv/)**: Fast Python package manager
+- **[Google Cloud SDK](https://cloud.google.com/sdk/docs/install)** (`gcloud` CLI)
+- **Google Cloud Project** with Vertex AI enabled and a Cloud Storage bucket
 
-## Getting started
+---
 
-### Google Agents CLI (recommended)
+## Getting Started
 
-Use the [Google Agents CLI](https://github.com/google/agents-cli) to scaffold a production-ready project and choose your deployment target ([Agent Runtime](https://docs.cloud.google.com/gemini-enterprise-agent-platform/build/runtime) or [Cloud Run](https://cloud.google.com/run)), with CI/CD and other production features.
-
-**Install the CLI** (one-time):
+### 1. Clone & Install Dependencies
 
 ```bash
-uvx google-agents-cli setup
-```
-
-**Create the project from this sample** (replace `my-short-movie-agents` with your project name):
-
-```bash
-agents-cli create my-short-movie-agents -a adk@short-movie-agents
-```
-
-The Google Agents CLI will prompt you to select deployment options and set up your Google Cloud project.
-
-From your newly created project directory (e.g. `my-short-movie-agents`), run:
-
-```bash
+git clone https://github.com/rjshnautiyal31-cloud/my-short-movie-agents.git
 cd my-short-movie-agents
 uv sync --dev
-uv run adk run app
 ```
 
-For the web UI:
+### 2. Configure Environment Variables
+
+Create your `.env` file from the template:
 
 ```bash
-uv run adk web
+cp .env-template .env
 ```
 
-Then select **app** from the dropdown menu.
+Edit `.env` with your Google Cloud details:
 
-<details>
-<summary>Alternative: Clone this repository and run the sample locally</summary>
+```ini
+GOOGLE_CLOUD_PROJECT=your-gcp-project-id
+GOOGLE_CLOUD_LOCATION=us-central1
+GOOGLE_CLOUD_BUCKET_NAME=your-gcs-bucket-name
+GOOGLE_GENAI_USE_VERTEXAI=TRUE
+```
 
-### Run from this repository
+### 3. Grant Vertex AI Bucket Permissions
 
-Use this path to run the **adk-samples** checkout of Short Movie Agents without scaffolding a new project.
-
-1. **Clone and enter the sample directory:**
-
-   ```bash
-   git clone https://github.com/google/adk-samples.git
-   cd adk-samples/python/agents/short-movie-agents
-   ```
-
-   Stay in `python/agents/short-movie-agents` for the steps below.
-
-2. **Install dependencies:**
-
-   ```bash
-   uv sync --dev
-   ```
-
-   Or use `make install` (equivalent).
-
-3. **Configure environment:**
-
-   ```bash
-   cp .env-template .env
-   # Uncomment and update the environment variables for your project
-   ```
-
-   You can also export variables in your shell, for example:
-
-   ```bash
-   export GOOGLE_CLOUD_PROJECT=my-project
-   export GOOGLE_CLOUD_LOCATION=my-region
-   # Optional: for Vertex AI
-   export GOOGLE_GENAI_USE_VERTEXAI=1
-   ```
-
-4. **Run the agent**
-
-   - **ADK web UI:** Either run `make playground` or:
-
-     ```bash
-     source .env
-     uv run adk web . --port 8501 --reload_agents
-     ```
-
-     When prompted, select the **app** folder.
-
-   - **ADK CLI:**
-
-     ```bash
-     source .env
-     uv run adk run app
-     ```
-
-### Development (from this repository)
+Ensure the Vertex AI service agent has access to write generated media into your Cloud Storage bucket:
 
 ```bash
-uv sync --dev
-uv run pytest
-```
+# Get your project number
+PROJECT_NUMBER=$(gcloud projects describe YOUR_PROJECT_ID --format='value(projectNumber)')
 
-### Storage Bucket
+# Create Vertex AI service identity if not already created
+gcloud beta services identity create --service=aiplatform.googleapis.com --project=YOUR_PROJECT_ID
 
-Note that the agent uses a bucket for storing generated storyboards and videos. You can create a bucket by running:
-
-```
-gcloud storage buckets create gs://YOUR_BUCKET_NAME --project=PROJECT_ID --location=LOCATION
-```
-
-Make sure the account running the agent has read/write permissions to that bucket by running:
-
-```
+# Grant Storage Object Admin role on the bucket
 gcloud storage buckets add-iam-policy-binding gs://YOUR_BUCKET_NAME \
-    --member="serviceAccount:service-PROJECT_NUMBER@gcp-sa-aiplatform.iam.gserviceaccount.com" \
+    --member="serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-aiplatform.iam.gserviceaccount.com" \
     --role="roles/storage.objectAdmin"
 ```
 
-</details>
+---
+
+## Running the Agents
+
+### Option A: Interactive CLI (Terminal)
+
+Launch the conversational Director Agent directly in your terminal:
+
+```bash
+uv run adk run app
+```
+
+Example prompt:
+> *"I want to create a short movie about a brave little squirrel discovering a glowing crystal in the forest."*
+
+---
+
+### Option B: Interactive Web UI (Playground)
+
+Launch the ADK Web Playground:
+
+```bash
+make playground
+# or: uv run adk web app --port 8501
+```
+
+Open your browser at `http://localhost:8501`.
+
+---
+
+### Option C: Consolidating Previous Session Clips
+
+If you already have scene clips from a previous session and want to stitch them into a single movie:
+
+```bash
+uv run python -m app.merge_session <SESSION_ID>
+```
+
+*(e.g., `uv run python -m app.merge_session a0ea7f1f-b17d-4cb3-b3a8-aab6e8c91e58`)*
+
+The output `final_movie.mp4` will be uploaded directly to `gs://YOUR_BUCKET_NAME/<SESSION_ID>/final_movie.mp4`.
+
+---
 
 ## Commands
 
-| Command              | Description                                                                                 |
-| -------------------- | ------------------------------------------------------------------------------------------- |
-| `make install`       | Install all required dependencies using uv                                                  |
-| `make playground`    | Launch the ADK web UI (`adk web` with reload); select the **app** folder when prompted. |
-| `make backend`       | Deploy agent to Cloud Run |
-| `make local-backend` | Launch local development server |
-| `make test`          | Run unit and integration tests                                                              |
-| `make lint`          | Run code quality checks (codespell, ruff, mypy)                                             |
-| `uv run jupyter lab` | Launch Jupyter notebook                                                                     |
+| Command | Description |
+|---|---|
+| `uv run adk run app` | Run the Director Agent in terminal mode |
+| `make playground` | Launch the ADK web UI on port 8501 |
+| `make local-backend` | Launch local FastAPI server with hot-reload |
+| `make test` | Run unit and integration tests |
+| `make lint` | Run code quality checks (ruff, codespell, mypy) |
+| `uv run python -m app.merge_session <ID>` | Stitch all scene clips for a session into `final_movie.mp4` |
 
-For full command options and usage, refer to the [Makefile](Makefile).
+---
 
+## License
 
-## Usage
-
-This sample follows a "bring your own agent" style: you implement behavior under `app/`, while a project scaffolded with the [Google Agents CLI](#google-agents-cli-recommended) can supply UI, infrastructure, deployment, and monitoring around that agent.
-
-1. **Integrate:** Update the agent by editing files in the `app` folder.
-2. **Test:** Explore the agent in the ADK web UI (for example `make playground` from this repo). The UI supports chat history, feedback, and reloads when you change code.
-3. **Deploy:** Use the [Google Agents CLI](#google-agents-cli-recommended) flow under [Getting started](#getting-started) to pick a deployment target (Agent Runtime or Cloud Run) and CI/CD. If you use a checkout of this repository, you can deploy with `make backend` (see [Commands](#commands)).
-4. **Monitor:** Track performance with Cloud Logging, Tracing, and the Looker Studio dashboard (see [Monitoring and Observability](#monitoring-and-observability)).
-
-The project includes a `GEMINI.md` file that provides context for AI tools like Gemini CLI when asking questions about the project.
-
-## Monitoring and Observability
-
-You can use [this Looker Studio dashboard](https://lookerstudio.google.com/reporting/46b35167-b38b-4e44-bd37-701ef4307418/page/tEnnC) template to visualize events logged in BigQuery. See the "Setup Instructions" tab to get started.
-
-The application uses OpenTelemetry for observability: events go to Google Cloud Trace and Logging, and to BigQuery for longer-term analysis.
-
-## Disclaimer
-
-This list is not an official Google product. Links on this list also are not necessarily to official Google products.
-
-Initial agent structure was generated with [[`google/agents-cli`](https://github.com/google/agents-cli)](https://github.com/google/agents-cli) version `0.15.4`.
+Apache License 2.0

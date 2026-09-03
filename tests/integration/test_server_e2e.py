@@ -49,7 +49,7 @@ def start_server() -> subprocess.Popen[str]:
         sys.executable,
         "-m",
         "uvicorn",
-        "short_movie_agents.fast_api_app:app",
+        "app.server:app",
         "--host",
         "0.0.0.0",
         "--port",
@@ -119,7 +119,7 @@ def test_chat_stream(server_fixture: subprocess.Popen[str]) -> None:
     user_id = "test_user_123"
     session_data = {"state": {"preferred_language": "English", "visit_count": 1}}
 
-    session_url = f"{BASE_URL}/apps/short_movie_agents/users/{user_id}/sessions"
+    session_url = f"{BASE_URL}/apps/app/users/{user_id}/sessions"
     session_response = requests.post(
         session_url,
         headers=HEADERS,
@@ -132,7 +132,7 @@ def test_chat_stream(server_fixture: subprocess.Popen[str]) -> None:
 
     # Then send chat message
     data = {
-        "app_name": "short_movie_agents",
+        "app_name": "app",
         "user_id": user_id,
         "session_id": session_id,
         "new_message": {

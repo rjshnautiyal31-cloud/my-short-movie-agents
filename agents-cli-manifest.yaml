@@ -1,6 +1,6 @@
 name: "my-short-movie-agents"
 acli_version: "0.3.1"
-agent_directory: "short_movie_agents"
+agent_directory: "app"
 region: "us-east1"
 base_template: "remote_-1721287637585628857"
 generated_at: "2026-06-10T16:13:21.034744+00:00"
