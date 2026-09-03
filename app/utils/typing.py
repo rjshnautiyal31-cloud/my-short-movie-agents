@@ -40,7 +40,7 @@ class Feedback(BaseModel):
 
     score: int | float
     text: str | None = ""
-    invocation_id: str
+    invocation_id: str = ""
     log_type: Literal["feedback"] = "feedback"
     service_name: Literal["test-agent"] = "test-agent"
     user_id: str = ""

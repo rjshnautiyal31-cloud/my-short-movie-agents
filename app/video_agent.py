@@ -74,6 +74,21 @@ def video_generate(
         if dialogue:
             prompt += f"\n\nAudio:\n{dialogue}"
 
+        # Resolve storyboard image input for Image-to-Video (I2V)
+        image_input = None
+        if image_link:
+            gs_image_uri = image_link.strip()
+            if gs_image_uri.startswith(AUTHORIZED_URI):
+                gs_image_uri = gs_image_uri.replace(AUTHORIZED_URI, "gs://")
+            elif gs_image_uri.startswith("https://storage.googleapis.com/"):
+                gs_image_uri = gs_image_uri.replace(
+                    "https://storage.googleapis.com/", "gs://"
+                )
+
+            if gs_image_uri.startswith("gs://"):
+                image_input = types.Image(gcs_uri=gs_image_uri, mime_type="image/png")
+                logger.info(f"Using Image-to-Video with storyboard: {gs_image_uri}")
+
         # Actual video generation
         logger.info(
             f"Generating video for prompt '{prompt}' and image '{image_link}'"
@@ -88,6 +103,7 @@ def video_generate(
         operation = client.models.generate_videos(
             model=VIDEO_MODEL,
             prompt=prompt,
+            image=image_input,
             config=types.GenerateVideosConfig(
                 aspect_ratio=ASPECT_RATIO,
                 output_gcs_uri=f"{GCS_PATH}/scene_{scene_number}",
