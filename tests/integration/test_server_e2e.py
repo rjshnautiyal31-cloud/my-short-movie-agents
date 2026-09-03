@@ -199,6 +199,7 @@ def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:
         "score": 4,
         "user_id": "test-user-456",
         "session_id": "test-session-456",
+        "invocation_id": "test-inv-456",
         "text": "Great response!",
     }
 
