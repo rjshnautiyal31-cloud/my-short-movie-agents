@@ -82,3 +82,53 @@ def test_resolve_user_photo_from_inline_data():
 
     raw_bytes, uri = resolve_user_photo_bytes_and_uri(mock_context)
     assert raw_bytes == dummy_bytes
+
+
+def test_is_frontal_pose():
+    from app.utils.face_lock import is_frontal_pose
+
+    # Normal frontal landmarks: re, le, nose, mouth_r, mouth_l
+    frontal_landmarks = np.array([
+        [40.0, 50.0],
+        [60.0, 50.0],
+        [50.0, 60.0],
+        [42.0, 75.0],
+        [58.0, 75.0],
+    ])
+    assert is_frontal_pose(frontal_landmarks) is True
+
+    # Extreme turned profile landmarks: nose way off to the side
+    turned_landmarks = np.array([
+        [40.0, 50.0],
+        [60.0, 50.0],
+        [32.0, 60.0],  # Nose outside eye span
+        [35.0, 75.0],
+        [45.0, 75.0],
+    ])
+    assert is_frontal_pose(turned_landmarks) is False
+
+
+def test_swap_face_video_mode_feathers():
+    from app.utils.face_lock import swap_face
+
+    src_bgr = np.full((100, 100, 3), (200, 150, 120), dtype=np.uint8)
+    tgt_bgr = np.full((100, 100, 3), (50, 50, 50), dtype=np.uint8)
+
+    face_dict = {
+        "landmarks": np.array([
+            [40.0, 40.0],
+            [60.0, 40.0],
+            [50.0, 55.0],
+            [42.0, 70.0],
+            [58.0, 70.0],
+        ]),
+        "bbox": [20, 20, 60, 60],
+        "score": 0.95,
+    }
+
+    result = swap_face(src_bgr, tgt_bgr, face_dict, face_dict, is_video=True)
+    assert result.shape == tgt_bgr.shape
+    assert result.dtype == np.uint8
+    # Video mode feathered blend modifies face region without crashing
+    assert not np.array_equal(result, tgt_bgr)
+

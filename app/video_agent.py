@@ -136,6 +136,15 @@ def video_generate(
             if gs_image_uri.startswith("gs://"):
                 image_input = types.Image(gcs_uri=gs_image_uri, mime_type="image/png")
                 logger.info(f"Using Image-to-Video with storyboard: {gs_image_uri}")
+                prompt = (
+                    f"{prompt}\n\n"
+                    "[CINEMATIC CHARACTER CONTINUITY & COHERENCE]\n"
+                    "- The video must animate directly from the provided reference image (Frame 0).\n"
+                    "- Strictly preserve the exact face, facial features, skin tone, hair, and clothing "
+                    "of the character from the reference image throughout the entire clip.\n"
+                    "- Fluid 3D motion, natural eye gaze and head movement, photorealistic cinematic lighting.\n"
+                    "- Do NOT morph, flicker, distort, or alter the character's facial likeness from Frame 0."
+                )
 
         # Actual video generation
         logger.info(
@@ -178,11 +187,23 @@ def video_generate(
             # Check if user photo is available for post-processing face-lock pass
             user_photo_bytes, _ = resolve_user_photo_bytes_and_uri(tool_context)
 
-            if user_photo_bytes:
+            # When Image-to-Video (I2V) is used, Veo natively animates Frame 0 (which already
+            # has the user's authentic face cleanly composited) with 3D temporal coherence.
+            # Running frame-by-frame 2D replacement on top of Veo disrupts natural 3D head motion
+            # and speaking in moving scenes. Therefore, frame-by-frame post-processing is reserved
+            # for text-only video or when ENABLE_VIDEO_FRAME_FACE_LOCK is explicitly enabled.
+            enable_frame_face_lock = os.getenv(
+                "ENABLE_VIDEO_FRAME_FACE_LOCK", "false"
+            ).lower() in ("true", "1")
+            should_post_process = user_photo_bytes and (
+                image_input is None or enable_frame_face_lock
+            )
+
+            if should_post_process and user_photo_bytes:
                 storage_client = storage.Client(project=project_id)
                 for uri in raw_uris:
                     try:
-                        logger.info(f"Refining video with Exact Face-Lock: {uri}")
+                        logger.info(f"Refining video with stabilized Face-Lock: {uri}")
                         blob = storage.Blob.from_string(uri, client=storage_client)
                         temp_raw = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
                         temp_locked = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
@@ -200,7 +221,7 @@ def video_generate(
                                 temp_locked, content_type="video/mp4"
                             )
                             logger.info(
-                                f"Uploaded face-locked video back to GCS: {uri}"
+                                f"Uploaded stabilized face-locked video back to GCS: {uri}"
                             )
 
                         if os.path.exists(temp_raw):

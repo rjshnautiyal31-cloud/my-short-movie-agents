@@ -172,16 +172,54 @@ def _reinhard_color_transfer(
     return cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
 
 
+def is_frontal_pose(landmarks: np.ndarray) -> bool:
+    """Check if the face is facing relatively forward (yaw/pitch within acceptable range for 2D warping)."""
+    if landmarks is None or len(landmarks) < 5:
+        return True
+    try:
+        re = np.array(landmarks[0], dtype=np.float32)
+        le = np.array(landmarks[1], dtype=np.float32)
+        nose = np.array(landmarks[2], dtype=np.float32)
+
+        eye_dist = float(np.linalg.norm(le - re))
+        if eye_dist < 8.0:
+            return False
+
+        eye_vec = le - re
+        nose_vec = nose - re
+        proj = float(np.dot(nose_vec, eye_vec) / (eye_dist**2 + 1e-6))
+
+        # Frontal face has nose between eyes (projection ratio between 0.25 and 0.75)
+        if proj < 0.25 or proj > 0.75:
+            return False
+
+        # Check roll / tilt angle
+        dy = abs(float(le[1] - re[1]))
+        dx = abs(float(le[0] - re[0]))
+        angle = np.degrees(np.arctan2(dy, max(dx, 1e-5)))
+        if angle > 32.0:
+            return False
+
+        return True
+    except Exception:
+        return True
+
+
 def swap_face(
     source_bgr: np.ndarray,
     target_bgr: np.ndarray,
     source_face: dict[str, Any],
     target_face: dict[str, Any],
+    is_video: bool = False,
 ) -> np.ndarray:
     """Seamlessly swap and lock source face onto target face using 5-point landmark similarity."""
     try:
         src_landmarks = source_face["landmarks"]
         tgt_landmarks = target_face["landmarks"]
+
+        # For video: if head is in a steep turn or tilt, skip 2D paste to avoid distortion
+        if is_video and not is_frontal_pose(tgt_landmarks):
+            return target_bgr
 
         # Compute optimal 2D affine / similarity transform using all 5 landmarks
         warp_mat, _ = cv2.estimateAffinePartial2D(src_landmarks, tgt_landmarks)
@@ -218,27 +256,39 @@ def swap_face(
             warped_crop, tgt_crop
         )
 
-        # Create smooth elliptical boundary mask
+        # Create smooth elliptical boundary mask with feathered edges
         mask = np.zeros((h, w), dtype=np.uint8)
         center = (int(tx + tw / 2), int(ty + th / 2))
-        axes = (int(tw * 0.44), int(th * 0.54))
+        axes = (int(tw * 0.42), int(th * 0.50))
         cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
-        mask = cv2.GaussianBlur(mask, (15, 15), 10)
+        blur_kernel = 25 if is_video else 15
+        mask = cv2.GaussianBlur(mask, (blur_kernel, blur_kernel), blur_kernel // 2)
 
-        # Seamless Poisson cloning
-        try:
-            blended = cv2.seamlessClone(
-                matched_source, target_bgr, mask, center, cv2.NORMAL_CLONE
-            )
-            return blended
-        except Exception:
-            # Alpha blend fallback
+        if is_video:
+            # Video Mode: NEVER use cv2.seamlessClone!
+            # Poisson cloning solves PDEs per frame independently, causing severe temporal flicker.
+            # Feathered alpha blending guarantees smooth temporal continuity without inter-frame flicker.
             alpha = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
             blended = (
                 matched_source.astype(np.float32) * alpha
                 + target_bgr.astype(np.float32) * (1.0 - alpha)
             ).astype(np.uint8)
             return blended
+        else:
+            # Still image (storyboard Frame 0) mode
+            try:
+                blended = cv2.seamlessClone(
+                    matched_source, target_bgr, mask, center, cv2.NORMAL_CLONE
+                )
+                return blended
+            except Exception:
+                # Alpha blend fallback
+                alpha = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
+                blended = (
+                    matched_source.astype(np.float32) * alpha
+                    + target_bgr.astype(np.float32) * (1.0 - alpha)
+                ).astype(np.uint8)
+                return blended
 
     except Exception as e:
         logger.warning(f"Face swap failed: {e}")
@@ -279,7 +329,7 @@ def composite_face_into_image_bytes(
         logger.info(
             f"Locking exact face onto storyboard character (conf: src={src_face['score']:.2f}, tgt={tgt_face['score']:.2f})"
         )
-        blended_bgr = swap_face(src_bgr, tgt_bgr, src_face, tgt_face)
+        blended_bgr = swap_face(src_bgr, tgt_bgr, src_face, tgt_face, is_video=False)
 
         blended_rgb = cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
         out_pil = Image.fromarray(blended_rgb)
@@ -295,7 +345,7 @@ def composite_face_into_image_bytes(
 def apply_face_lock_to_video(
     input_video_path: str, user_photo_bytes: bytes, output_video_path: str
 ) -> bool:
-    """Process a generated video frame-by-frame to lock the user's exact face."""
+    """Process a generated video frame-by-frame with temporally-smoothed, flicker-free face locking."""
     if not user_photo_bytes or not os.path.exists(input_video_path):
         return False
 
@@ -321,37 +371,69 @@ def apply_face_lock_to_video(
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         logger.info(
-            f"Applying Face-Lock to video ({total_frames} frames @ {fps} fps, {width}x{height})"
+            f"Applying stabilized Face-Lock to video ({total_frames} frames @ {fps} fps, {width}x{height})"
         )
 
         temp_out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(temp_out, fourcc, fps, (width, height))
 
-        # Temporal smoothing buffer for target face landmarks
+        # Temporal smoothing buffers
         prev_landmarks = None
-        smoothing_alpha = 0.75  # 75% current frame, 25% previous frame for stability
+        prev_bbox = None
+        missed_frames = 0
+        max_coast_frames = 2
+        smoothing_alpha = 0.82  # 82% current frame, 18% history for responsive stability
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            tgt_faces = detect_faces(frame, score_threshold=0.2)
+            tgt_faces = detect_faces(frame, score_threshold=0.25)
             if tgt_faces:
                 # Main character in video is the largest face by area
                 tgt_face = max(tgt_faces, key=lambda f: f["bbox"][2] * f["bbox"][3])
-                if prev_landmarks is not None:
-                    # Smooth landmarks across frames
-                    tgt_face["landmarks"] = (
-                        smoothing_alpha * tgt_face["landmarks"]
-                        + (1.0 - smoothing_alpha) * prev_landmarks
-                    )
-                prev_landmarks = tgt_face["landmarks"].copy()
 
-                frame = swap_face(src_bgr, frame, src_face, tgt_face)
+                if is_frontal_pose(tgt_face["landmarks"]):
+                    if prev_landmarks is not None:
+                        # Smooth landmarks across frames
+                        tgt_face["landmarks"] = (
+                            smoothing_alpha * tgt_face["landmarks"]
+                            + (1.0 - smoothing_alpha) * prev_landmarks
+                        )
+                        tgt_face["bbox"] = [
+                            int(smoothing_alpha * c + (1.0 - smoothing_alpha) * p)
+                            for c, p in zip(tgt_face["bbox"], prev_bbox)
+                        ]
+                    prev_landmarks = tgt_face["landmarks"].copy()
+                    prev_bbox = list(tgt_face["bbox"])
+                    missed_frames = 0
+
+                    frame = swap_face(
+                        src_bgr, frame, src_face, tgt_face, is_video=True
+                    )
+                else:
+                    # Non-frontal pose: let natural motion render, softly decay buffer
+                    if prev_landmarks is not None:
+                        prev_landmarks = (
+                            0.5 * tgt_face["landmarks"] + 0.5 * prev_landmarks
+                        )
+            elif prev_landmarks is not None and missed_frames < max_coast_frames:
+                # Coast for up to 2 frames to avoid 1-frame drop strobe
+                missed_frames += 1
+                coasted_face = {
+                    "landmarks": prev_landmarks,
+                    "bbox": prev_bbox,
+                    "score": 0.5,
+                }
+                frame = swap_face(
+                    src_bgr, frame, src_face, coasted_face, is_video=True
+                )
             else:
                 prev_landmarks = None
+                prev_bbox = None
+                missed_frames = 0
 
             writer.write(frame)
 
