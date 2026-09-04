@@ -15,10 +15,12 @@
 import logging
 
 from google.adk.agents import Agent
+from google.adk.agents.callback_context import CallbackContext
 
 from .screenplay_agent import screenplay_agent
 from .story_agent import story_agent
 from .storyboard_agent import storyboard_agent
+from .utils.face_lock import resolve_user_photo_bytes_and_uri
 from .utils.utils import load_prompt_from_file
 from .video_agent import video_agent
 
@@ -27,7 +29,21 @@ logger = logging.getLogger(__name__)
 
 # Configuration constants
 MODEL = "gemini-2.5-flash"
-DESCRIPTION = "Orchestrates the creation of a short, animated campfire story based on user input, utilizing specialized sub-agents for story generation, storyboard creation, and video generation."
+DESCRIPTION = (
+    "Orchestrates the creation of a short, animated campfire story based on user input, "
+    "utilizing specialized sub-agents for story generation, storyboard creation, and video generation."
+)
+
+
+def extract_and_store_user_photo(callback_context: CallbackContext) -> None:
+    """Automatically extracts user uploaded photos from events, inline data, or input and saves to GCS."""
+    try:
+        raw_bytes, uri = resolve_user_photo_bytes_and_uri(callback_context)
+        if raw_bytes:
+            logger.info(f"✅ Root Director auto-captured user photo into session -> {uri}")
+    except Exception as e:
+        logger.warning(f"Error in extract_and_store_user_photo callback: {e}")
+
 
 # --- Director Agent (root agent) ---
 
@@ -37,6 +53,7 @@ if story_agent and screenplay_agent and storyboard_agent and video_agent:
         model=MODEL,
         description=(DESCRIPTION),
         instruction=load_prompt_from_file("director_agent.txt"),
+        before_agent_callback=extract_and_store_user_photo,
         sub_agents=[
             story_agent,
             screenplay_agent,

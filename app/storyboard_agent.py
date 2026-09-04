@@ -25,7 +25,11 @@ from google.adk.tools import ToolContext
 from google.cloud import storage
 from google.genai import types
 
-from .utils.face_lock import composite_face_into_image_bytes
+from .utils.face_lock import (
+    _load_image_bytes,
+    composite_face_into_image_bytes,
+    resolve_user_photo_bytes_and_uri,
+)
 from .utils.utils import load_prompt_from_file
 
 # Set logging
@@ -50,48 +54,6 @@ STRICT_NEGATIVE_PROMPT = (
 )
 
 
-def _load_image_bytes(
-    path_or_uri: str, project_id: str, bucket_name: str
-) -> bytes | None:
-    """Helper to load raw image bytes from local file path, GCS URI, or HTTP URL."""
-    if not path_or_uri:
-        return None
-
-    try:
-        normalized = path_or_uri.strip()
-        authorized_uri = "https://storage.mtls.cloud.google.com/"
-
-        if normalized.startswith(authorized_uri):
-            normalized = normalized.replace(authorized_uri, "gs://")
-        elif normalized.startswith("https://storage.googleapis.com/"):
-            normalized = normalized.replace("https://storage.googleapis.com/", "gs://")
-
-        # Case 1: GCS URI
-        if normalized.startswith("gs://"):
-            storage_client = storage.Client(project=project_id)
-            blob = storage.Blob.from_string(normalized, client=storage_client)
-            return blob.download_as_bytes()
-
-        # Case 2: Local file path
-        if os.path.exists(normalized):
-            with open(normalized, "rb") as f:
-                return f.read()
-
-        # Case 3: Public HTTP/HTTPS URL
-        if normalized.startswith("http://") or normalized.startswith("https://"):
-            ctx = urllib.request.ssl._create_unverified_context()
-            req = urllib.request.Request(
-                normalized, headers={"User-Agent": "Mozilla/5.0"}
-            )
-            with urllib.request.urlopen(req, context=ctx) as resp:
-                return resp.read()
-
-    except Exception as e:
-        logger.warning(f"Could not load image bytes from '{path_or_uri}': {e}")
-
-    return None
-
-
 def _load_image_part(
     path_or_uri: str, project_id: str, bucket_name: str
 ) -> types.Part | None:
@@ -103,37 +65,6 @@ def _load_image_part(
             mime = "image/jpeg"
         return types.Part.from_bytes(data=img_bytes, mime_type=mime)
     return None
-
-
-def _find_user_photo_in_session(tool_context: ToolContext) -> str:
-    """Finds any user photo URI in session state or message events."""
-    try:
-        state = tool_context._invocation_context.session.state
-        if state.get("user_photo_gcs_uri"):
-            return str(state["user_photo_gcs_uri"])
-        if state.get("user_photo_uri"):
-            return str(state["user_photo_uri"])
-
-        # Scan session events
-        events = tool_context._invocation_context.session.events
-        for event in reversed(events):
-            if event.content and event.content.parts:
-                for part in event.content.parts:
-                    if part.text:
-                        match = re.search(
-                            r"(https?://\S+\.(?:png|jpe?g|webp)|gs://\S+\.(?:png|jpe?g|webp)|/[^\s'\"<>]+\.(?:png|jpe?g|webp)|[a-zA-Z0-9_\-./]+\.(?:png|jpe?g|webp))",
-                            part.text,
-                            re.IGNORECASE,
-                        )
-                        if match:
-                            uri = match.group(1).strip("'\")")
-                            if os.path.exists(uri) or uri.startswith("http") or uri.startswith("gs://"):
-                                state["user_photo_uri"] = uri
-                                logger.info(f"Auto-discovered user photo URI from conversation: {uri}")
-                                return uri
-    except Exception as e:
-        logger.debug(f"Event scan error: {e}")
-    return ""
 
 
 def create_character_profile(
@@ -175,9 +106,10 @@ def create_character_profile(
         state = tool_context._invocation_context.session.state
         clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", character_name.lower())
 
-        # Resolve photo URI if not explicitly passed
-        if not photo_path_or_url:
-            photo_path_or_url = _find_user_photo_in_session(tool_context)
+        # Resolve user photo bytes across all modalities
+        user_photo_bytes, resolved_uri = _resolve_user_photo_bytes_and_uri(
+            tool_context, photo_path_or_url
+        )
 
         # Unify visual style
         if not visual_style:
@@ -185,13 +117,10 @@ def create_character_profile(
         state["visual_style"] = visual_style
 
         logger.info(
-            f"Creating character reference profile for '{character_name}' (photo: {photo_path_or_url}, style: {visual_style})"
+            f"Creating character reference profile for '{character_name}' (has_photo={user_photo_bytes is not None}, style: {visual_style})"
         )
 
         contents: list[Any] = []
-        user_photo_bytes = None
-        if photo_path_or_url:
-            user_photo_bytes = _load_image_bytes(photo_path_or_url, project_id, bucket_name)
 
         if user_photo_bytes:
             # Save raw user photo to GCS for downstream face locking
@@ -202,7 +131,7 @@ def create_character_profile(
             user_photo_gcs = f"gs://{bucket_name}/{session_id}/user_photo.png"
 
             state["user_photo_gcs_uri"] = user_photo_gcs
-            state["user_photo_uri"] = photo_path_or_url
+            state["user_photo_uri"] = resolved_uri or user_photo_gcs
 
             photo_part = types.Part.from_bytes(data=user_photo_bytes, mime_type="image/png")
             contents.append(photo_part)
@@ -360,14 +289,7 @@ def storyboard_generate(
 
         if image_bytes:
             # Check for user photo face compositing to lock exact face on Frame 0
-            user_photo_gcs = state.get("user_photo_gcs_uri")
-            user_photo_uri = state.get("user_photo_uri") or _find_user_photo_in_session(tool_context)
-            user_photo_bytes = None
-
-            if user_photo_gcs:
-                user_photo_bytes = _load_image_bytes(user_photo_gcs, project_id, bucket_name)
-            elif user_photo_uri:
-                user_photo_bytes = _load_image_bytes(user_photo_uri, project_id, bucket_name)
+            user_photo_bytes, _ = resolve_user_photo_bytes_and_uri(tool_context)
 
             if user_photo_bytes:
                 logger.info(f"Compositing user exact face onto Scene {scene_number} storyboard frame")

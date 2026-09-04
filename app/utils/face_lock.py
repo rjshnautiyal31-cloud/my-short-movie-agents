@@ -15,6 +15,7 @@
 import io
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import urllib.request
@@ -23,6 +24,7 @@ from typing import Any
 import cv2
 import imageio_ffmpeg
 import numpy as np
+from google.cloud import storage
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -86,47 +88,58 @@ def detect_faces(
 ) -> list[dict[str, Any]]:
     """Detect faces and 5 key landmarks in a BGR image.
 
-    Tries primary score threshold, then falls back to more sensitive thresholds
-    if no faces are initially detected (essential for artistic/stylized scenes).
+    Uses adaptive multi-scale (1x, 1.5x, 2x) and multi-threshold detection
+    to detect faces even when characters are rendered at various camera distances,
+    angles, or stylizations.
     """
     h, w = image_bgr.shape[:2]
     if h <= 10 or w <= 10:
         return []
 
-    # Adaptive thresholds: start with requested, then try lower for stylizations
+    # Adaptive thresholds: start with requested, then try sensitive thresholds
     thresholds = [score_threshold]
     if score_threshold > 0.2:
         thresholds.append(0.2)
     if score_threshold > 0.15:
         thresholds.append(0.15)
 
-    for thresh in thresholds:
-        detector = _get_detector(w, h, score_threshold=thresh)
-        if detector is None:
-            continue
+    scales = [1.0, 1.5, 2.0]
 
-        try:
-            detector.setInputSize((w, h))
-            _, faces = detector.detect(image_bgr)
-            if faces is not None and len(faces) > 0:
-                results = []
-                for face in faces:
-                    bbox = [int(v) for v in face[0:4]]
-                    # 5 landmarks: right_eye, left_eye, nose_tip, right_mouth, left_mouth
-                    landmarks = np.array(
-                        face[4:14].reshape((5, 2)), dtype=np.float32
-                    )
-                    score = float(face[14])
-                    results.append(
-                        {
-                            "bbox": bbox,
-                            "landmarks": landmarks,
-                            "score": score,
-                        }
-                    )
-                return results
-        except Exception as e:
-            logger.warning(f"Face detection failed with thresh {thresh}: {e}")
+    for scale in scales:
+        if scale == 1.0:
+            proc_img = image_bgr
+            pw, ph = w, h
+        else:
+            pw, ph = int(w * scale), int(h * scale)
+            proc_img = cv2.resize(image_bgr, (pw, ph), interpolation=cv2.INTER_LINEAR)
+
+        for thresh in thresholds:
+            detector = _get_detector(pw, ph, score_threshold=thresh)
+            if detector is None:
+                continue
+
+            try:
+                detector.setInputSize((pw, ph))
+                _, faces = detector.detect(proc_img)
+                if faces is not None and len(faces) > 0:
+                    results = []
+                    inv_scale = 1.0 / scale
+                    for face in faces:
+                        bbox = [int(v * inv_scale) for v in face[0:4]]
+                        landmarks = np.array(
+                            face[4:14].reshape((5, 2)) * inv_scale, dtype=np.float32
+                        )
+                        score = float(face[14])
+                        results.append(
+                            {
+                                "bbox": bbox,
+                                "landmarks": landmarks,
+                                "score": score,
+                            }
+                        )
+                    return results
+            except Exception as e:
+                logger.debug(f"Face detection failed (scale={scale}, thresh={thresh}): {e}")
 
     return []
 
@@ -134,23 +147,27 @@ def detect_faces(
 def _reinhard_color_transfer(
     source_bgr: np.ndarray, target_bgr: np.ndarray
 ) -> np.ndarray:
-    """Match the color and lighting of source face to target scene in LAB space."""
+    """Match lighting and ambient warmth while strictly preserving user facial identity."""
     if source_bgr.size == 0 or target_bgr.size == 0:
         return source_bgr
 
     src_lab = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     tgt_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    src_mean, src_std = np.mean(src_lab, axis=(0, 1)), np.std(
-        src_lab, axis=(0, 1)
-    )
-    tgt_mean, tgt_std = np.mean(tgt_lab, axis=(0, 1)), np.std(
-        tgt_lab, axis=(0, 1)
-    )
+    src_mean = np.mean(src_lab, axis=(0, 1))
+    src_std = np.std(src_lab, axis=(0, 1))
+    tgt_mean = np.mean(tgt_lab, axis=(0, 1))
+    tgt_std = np.std(tgt_lab, axis=(0, 1))
 
     src_std = np.where(src_std < 1e-5, 1.0, src_std)
 
-    result_lab = (src_lab - src_mean) * (tgt_std / src_std) + tgt_mean
+    result_lab = src_lab.copy()
+    # Match luminance L to target scene lighting
+    result_lab[:, :, 0] = (src_lab[:, :, 0] - src_mean[0]) * (tgt_std[0] / src_std[0]) + tgt_mean[0]
+    # Retain 80% authentic facial chromaticity (A, B) and blend 20% ambient scene color
+    result_lab[:, :, 1:] = 0.80 * src_lab[:, :, 1:] + 0.20 * (
+        (src_lab[:, :, 1:] - src_mean[1:]) * (tgt_std[1:] / src_std[1:]) + tgt_mean[1:]
+    )
     result_lab = np.clip(result_lab, 0, 255).astype(np.uint8)
     return cv2.cvtColor(result_lab, cv2.COLOR_LAB2BGR)
 
@@ -256,7 +273,8 @@ def composite_face_into_image_bytes(
             return scene_image_bytes
 
         src_face = max(src_faces, key=lambda f: f["score"])
-        tgt_face = max(tgt_faces, key=lambda f: f["score"])
+        # Main protagonist in the scene is the largest face by bounding box area
+        tgt_face = max(tgt_faces, key=lambda f: f["bbox"][2] * f["bbox"][3])
 
         logger.info(
             f"Locking exact face onto storyboard character (conf: src={src_face['score']:.2f}, tgt={tgt_face['score']:.2f})"
@@ -321,7 +339,8 @@ def apply_face_lock_to_video(
 
             tgt_faces = detect_faces(frame, score_threshold=0.2)
             if tgt_faces:
-                tgt_face = max(tgt_faces, key=lambda f: f["score"])
+                # Main character in video is the largest face by area
+                tgt_face = max(tgt_faces, key=lambda f: f["bbox"][2] * f["bbox"][3])
                 if prev_landmarks is not None:
                     # Smooth landmarks across frames
                     tgt_face["landmarks"] = (
@@ -365,3 +384,175 @@ def apply_face_lock_to_video(
     except Exception as e:
         logger.error(f"Error in apply_face_lock_to_video: {e}")
         return False
+
+
+def _load_image_bytes(
+    path_or_uri: str, project_id: str = "", bucket_name: str = ""
+) -> bytes | None:
+    """Helper to load image bytes from GCS, local path, or URL."""
+    if not path_or_uri:
+        return None
+
+    try:
+        normalized = path_or_uri.strip()
+        authorized_uri = "https://storage.mtls.cloud.google.com/"
+        if normalized.startswith(authorized_uri):
+            normalized = normalized.replace(authorized_uri, "gs://")
+        elif normalized.startswith("https://storage.googleapis.com/"):
+            normalized = normalized.replace("https://storage.googleapis.com/", "gs://")
+
+        # Case 1: GCS URI
+        if normalized.startswith("gs://"):
+            storage_client = storage.Client(project=project_id or os.getenv("GOOGLE_CLOUD_PROJECT"))
+            blob = storage.Blob.from_string(normalized, client=storage_client)
+            return blob.download_as_bytes()
+
+        # Case 2: Local file path
+        if os.path.exists(normalized):
+            with open(normalized, "rb") as f:
+                return f.read()
+
+        # Case 3: Public HTTP/HTTPS URL
+        if normalized.startswith("http://") or normalized.startswith("https://"):
+            ctx = urllib.request.ssl._create_unverified_context()
+            req = urllib.request.Request(
+                normalized, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, context=ctx) as resp:
+                return resp.read()
+
+    except Exception as e:
+        logger.warning(f"Could not load image bytes from '{path_or_uri}': {e}")
+
+    return None
+
+
+def resolve_user_photo_bytes_and_uri(
+    context: Any, photo_path_or_url: str = ""
+) -> tuple[bytes | None, str]:
+    """Resolves and loads user photo bytes and GCS URI across all input modalities.
+
+    Works seamlessly with both CallbackContext (from director_agent) and ToolContext
+    (from sub-agents). Checks state, incoming user content, session history, and
+    raw byte uploads, persisting the photo to GCS so it is never dropped.
+    """
+    try:
+        session = getattr(context, "session", None)
+        if session is None and hasattr(context, "_invocation_context"):
+            session = context._invocation_context.session
+
+        state = getattr(context, "state", None)
+        if state is None and session is not None:
+            state = session.state
+
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "")
+        bucket_name = os.getenv("GOOGLE_CLOUD_BUCKET_NAME", "")
+        session_id = session.id if session else "default"
+
+        # 1. If explicit path/url was passed
+        if photo_path_or_url:
+            raw_bytes = _load_image_bytes(photo_path_or_url, project_id, bucket_name)
+            if raw_bytes:
+                return raw_bytes, photo_path_or_url
+
+        # 2. If already saved in GCS
+        if state and state.get("user_photo_gcs_uri"):
+            gcs_uri = str(state["user_photo_gcs_uri"])
+            raw_bytes = _load_image_bytes(gcs_uri, project_id, bucket_name)
+            if raw_bytes:
+                return raw_bytes, gcs_uri
+
+        # 3. If local or web URI is in state
+        if state and state.get("user_photo_uri"):
+            uri = str(state["user_photo_uri"])
+            raw_bytes = _load_image_bytes(uri, project_id, bucket_name)
+            if raw_bytes:
+                return raw_bytes, uri
+
+        # 4. Check incoming user_content if on CallbackContext
+        user_content = getattr(context, "user_content", None)
+        if user_content and getattr(user_content, "parts", None):
+            for part in user_content.parts:
+                if getattr(part, "inline_data", None) and part.inline_data.data:
+                    raw_bytes = part.inline_data.data
+                    if project_id and bucket_name and session_id:
+                        try:
+                            storage_client = storage.Client(project=project_id)
+                            bucket = storage_client.bucket(bucket_name)
+                            blob = bucket.blob(f"{session_id}/user_photo.png")
+                            blob.upload_from_string(raw_bytes, content_type="image/png")
+                            gcs_uri = f"gs://{bucket_name}/{session_id}/user_photo.png"
+                            if state:
+                                state["user_photo_gcs_uri"] = gcs_uri
+                                state["user_photo_uri"] = gcs_uri
+                            return raw_bytes, gcs_uri
+                        except Exception as e:
+                            logger.warning(f"Failed to upload user photo to GCS: {e}")
+                    return raw_bytes, "inline_upload"
+                elif getattr(part, "file_data", None) and part.file_data.file_uri:
+                    uri = part.file_data.file_uri
+                    raw_bytes = _load_image_bytes(uri, project_id, bucket_name)
+                    if raw_bytes:
+                        if state:
+                            state["user_photo_uri"] = uri
+                        return raw_bytes, uri
+                elif getattr(part, "text", None):
+                    match = re.search(
+                        r"(https?://\S+\.(?:png|jpe?g|webp)|gs://\S+\.(?:png|jpe?g|webp)|/[^\s'\"<>]+\.(?:png|jpe?g|webp)|[a-zA-Z0-9_\-./]+\.(?:png|jpe?g|webp))",
+                        part.text,
+                        re.IGNORECASE,
+                    )
+                    if match:
+                        uri = match.group(1).strip("'\")")
+                        raw_bytes = _load_image_bytes(uri, project_id, bucket_name)
+                        if raw_bytes:
+                            if state:
+                                state["user_photo_uri"] = uri
+                            return raw_bytes, uri
+
+        # 5. Scan session events (checking inline_data, file_data, and text)
+        if session and getattr(session, "events", None):
+            for event in reversed(session.events):
+                if event.content and getattr(event.content, "parts", None):
+                    for part in event.content.parts:
+                        if getattr(part, "inline_data", None) and part.inline_data.data:
+                            raw_bytes = part.inline_data.data
+                            if project_id and bucket_name and session_id:
+                                try:
+                                    storage_client = storage.Client(project=project_id)
+                                    bucket = storage_client.bucket(bucket_name)
+                                    blob = bucket.blob(f"{session_id}/user_photo.png")
+                                    blob.upload_from_string(raw_bytes, content_type="image/png")
+                                    gcs_uri = f"gs://{bucket_name}/{session_id}/user_photo.png"
+                                    if state:
+                                        state["user_photo_gcs_uri"] = gcs_uri
+                                        state["user_photo_uri"] = gcs_uri
+                                    return raw_bytes, gcs_uri
+                                except Exception as e:
+                                    logger.warning(f"Failed to upload user photo to GCS: {e}")
+                            return raw_bytes, "inline_upload"
+                        elif getattr(part, "file_data", None) and part.file_data.file_uri:
+                            uri = part.file_data.file_uri
+                            raw_bytes = _load_image_bytes(uri, project_id, bucket_name)
+                            if raw_bytes:
+                                if state:
+                                    state["user_photo_uri"] = uri
+                                return raw_bytes, uri
+                        elif getattr(part, "text", None):
+                            match = re.search(
+                                r"(https?://\S+\.(?:png|jpe?g|webp)|gs://\S+\.(?:png|jpe?g|webp)|/[^\s'\"<>]+\.(?:png|jpe?g|webp)|[a-zA-Z0-9_\-./]+\.(?:png|jpe?g|webp))",
+                                part.text,
+                                re.IGNORECASE,
+                            )
+                            if match:
+                                uri = match.group(1).strip("'\")")
+                                raw_bytes = _load_image_bytes(uri, project_id, bucket_name)
+                                if raw_bytes:
+                                    if state:
+                                        state["user_photo_uri"] = uri
+                                    return raw_bytes, uri
+    except Exception as ex:
+        logger.warning(f"Error resolving user photo bytes: {ex}")
+
+    return None, ""
+
