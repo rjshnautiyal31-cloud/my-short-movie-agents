@@ -39,7 +39,6 @@ def _ensure_model_exists() -> str:
         os.makedirs(MODEL_DIR, exist_ok=True)
         logger.info(f"Downloading YuNet face detector model to {MODEL_PATH}...")
         try:
-            # Download with unverified SSL context if needed
             ctx = urllib.request.ssl._create_unverified_context()
             with urllib.request.urlopen(MODEL_URL, context=ctx) as response, open(
                 MODEL_PATH, "wb"
@@ -48,7 +47,6 @@ def _ensure_model_exists() -> str:
             logger.info("YuNet model downloaded successfully.")
         except Exception as e:
             logger.error(f"Failed to download YuNet model via urllib: {e}")
-            # Try curl fallback
             try:
                 subprocess.run(
                     ["curl", "-k", "-L", "-o", MODEL_PATH, MODEL_URL],
@@ -60,8 +58,10 @@ def _ensure_model_exists() -> str:
     return MODEL_PATH
 
 
-def _get_detector(width: int, height: int) -> cv2.FaceDetectorYN | None:
-    """Initialize or configure YuNet face detector with specified dimensions."""
+def _get_detector(
+    width: int, height: int, score_threshold: float = 0.3
+) -> cv2.FaceDetectorYN | None:
+    """Initialize or configure YuNet face detector with adaptive sensitivity."""
     try:
         model_path = _ensure_model_exists()
         if not os.path.exists(model_path):
@@ -70,9 +70,9 @@ def _get_detector(width: int, height: int) -> cv2.FaceDetectorYN | None:
             model_path,
             "",
             (width, height),
-            0.6,  # Score threshold
-            0.3,  # NMS threshold
-            5000,  # Top K
+            score_threshold,  # Adaptive score threshold
+            0.3,              # NMS threshold
+            5000,             # Top K
         )
         detector.setInputSize((width, height))
         return detector
@@ -81,46 +81,63 @@ def _get_detector(width: int, height: int) -> cv2.FaceDetectorYN | None:
         return None
 
 
-def detect_faces(image_bgr: np.ndarray) -> list[dict[str, Any]]:
+def detect_faces(
+    image_bgr: np.ndarray, score_threshold: float = 0.3
+) -> list[dict[str, Any]]:
     """Detect faces and 5 key landmarks in a BGR image.
 
-    Returns:
-        list of dicts with keys: 'bbox' (x, y, w, h), 'landmarks' (5 points), 'score'.
+    Tries primary score threshold, then falls back to more sensitive thresholds
+    if no faces are initially detected (essential for artistic/stylized scenes).
     """
     h, w = image_bgr.shape[:2]
-    detector = _get_detector(w, h)
-    if detector is None:
+    if h <= 10 or w <= 10:
         return []
 
-    try:
-        detector.setInputSize((w, h))
-        _, faces = detector.detect(image_bgr)
-        if faces is None or len(faces) == 0:
-            return []
+    # Adaptive thresholds: start with requested, then try lower for stylizations
+    thresholds = [score_threshold]
+    if score_threshold > 0.2:
+        thresholds.append(0.2)
+    if score_threshold > 0.15:
+        thresholds.append(0.15)
 
-        results = []
-        for face in faces:
-            bbox = [int(v) for v in face[0:4]]
-            # 5 landmarks: right_eye, left_eye, nose_tip, right_mouth, left_mouth
-            landmarks = np.array(face[4:14].reshape((5, 2)), dtype=np.float32)
-            score = float(face[14])
-            results.append(
-                {
-                    "bbox": bbox,
-                    "landmarks": landmarks,
-                    "score": score,
-                }
-            )
-        return results
-    except Exception as e:
-        logger.warning(f"Face detection failed: {e}")
-        return []
+    for thresh in thresholds:
+        detector = _get_detector(w, h, score_threshold=thresh)
+        if detector is None:
+            continue
+
+        try:
+            detector.setInputSize((w, h))
+            _, faces = detector.detect(image_bgr)
+            if faces is not None and len(faces) > 0:
+                results = []
+                for face in faces:
+                    bbox = [int(v) for v in face[0:4]]
+                    # 5 landmarks: right_eye, left_eye, nose_tip, right_mouth, left_mouth
+                    landmarks = np.array(
+                        face[4:14].reshape((5, 2)), dtype=np.float32
+                    )
+                    score = float(face[14])
+                    results.append(
+                        {
+                            "bbox": bbox,
+                            "landmarks": landmarks,
+                            "score": score,
+                        }
+                    )
+                return results
+        except Exception as e:
+            logger.warning(f"Face detection failed with thresh {thresh}: {e}")
+
+    return []
 
 
 def _reinhard_color_transfer(
     source_bgr: np.ndarray, target_bgr: np.ndarray
 ) -> np.ndarray:
     """Match the color and lighting of source face to target scene in LAB space."""
+    if source_bgr.size == 0 or target_bgr.size == 0:
+        return source_bgr
+
     src_lab = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     tgt_lab = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
 
@@ -144,17 +161,18 @@ def swap_face(
     source_face: dict[str, Any],
     target_face: dict[str, Any],
 ) -> np.ndarray:
-    """Seamlessly swap and lock source face onto target face."""
+    """Seamlessly swap and lock source face onto target face using 5-point landmark similarity."""
     try:
         src_landmarks = source_face["landmarks"]
         tgt_landmarks = target_face["landmarks"]
 
-        # Compute affine transform based on landmarks (eyes + nose)
-        src_pts = np.float32([src_landmarks[0], src_landmarks[1], src_landmarks[2]])
-        tgt_pts = np.float32([tgt_landmarks[0], tgt_landmarks[1], tgt_landmarks[2]])
-
-        # 2x3 affine warp matrix
-        warp_mat = cv2.getAffineTransform(src_pts, tgt_pts)
+        # Compute optimal 2D affine / similarity transform using all 5 landmarks
+        warp_mat, _ = cv2.estimateAffinePartial2D(src_landmarks, tgt_landmarks)
+        if warp_mat is None:
+            # Fallback to 3 points if partial estimate fails
+            src_pts = np.float32([src_landmarks[0], src_landmarks[1], src_landmarks[2]])
+            tgt_pts = np.float32([tgt_landmarks[0], tgt_landmarks[1], tgt_landmarks[2]])
+            warp_mat = cv2.getAffineTransform(src_pts, tgt_pts)
 
         h, w = target_bgr.shape[:2]
         warped_source = cv2.warpAffine(
@@ -167,14 +185,13 @@ def swap_face(
 
         # Target bounding box
         tx, ty, tw, th = target_face["bbox"]
-        # Ensure within bounds
         tx, ty = max(0, tx), max(0, ty)
         tw, th = min(w - tx, tw), min(h - ty, th)
 
         if tw <= 10 or th <= 10:
             return target_bgr
 
-        # Crop target face region for color matching
+        # Crop target face region for lighting matching
         tgt_crop = target_bgr[ty : ty + th, tx : tx + tw]
         warped_crop = warped_source[ty : ty + th, tx : tx + tw]
 
@@ -184,21 +201,21 @@ def swap_face(
             warped_crop, tgt_crop
         )
 
-        # Create smooth elliptical mask
+        # Create smooth elliptical boundary mask
         mask = np.zeros((h, w), dtype=np.uint8)
         center = (int(tx + tw / 2), int(ty + th / 2))
-        axes = (int(tw * 0.42), int(th * 0.52))
+        axes = (int(tw * 0.44), int(th * 0.54))
         cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
         mask = cv2.GaussianBlur(mask, (15, 15), 10)
 
-        # Perform seamless Poisson cloning
+        # Seamless Poisson cloning
         try:
             blended = cv2.seamlessClone(
                 matched_source, target_bgr, mask, center, cv2.NORMAL_CLONE
             )
             return blended
         except Exception:
-            # Fallback to alpha blending
+            # Alpha blend fallback
             alpha = (mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
             blended = (
                 matched_source.astype(np.float32) * alpha
@@ -223,21 +240,21 @@ def composite_face_into_image_bytes(
         return scene_image_bytes
 
     try:
-        # Decode images
         src_pil = Image.open(io.BytesIO(user_photo_bytes)).convert("RGB")
         tgt_pil = Image.open(io.BytesIO(scene_image_bytes)).convert("RGB")
 
         src_bgr = cv2.cvtColor(np.array(src_pil), cv2.COLOR_RGB2BGR)
         tgt_bgr = cv2.cvtColor(np.array(tgt_pil), cv2.COLOR_RGB2BGR)
 
-        src_faces = detect_faces(src_bgr)
-        tgt_faces = detect_faces(tgt_bgr)
+        src_faces = detect_faces(src_bgr, score_threshold=0.3)
+        tgt_faces = detect_faces(tgt_bgr, score_threshold=0.2)
 
         if not src_faces or not tgt_faces:
-            logger.info("No face detected for swap in photo or storyboard; keeping original.")
+            logger.info(
+                f"Face detection count: src={len(src_faces)}, tgt={len(tgt_faces)}; keeping original."
+            )
             return scene_image_bytes
 
-        # Use highest confidence faces
         src_face = max(src_faces, key=lambda f: f["score"])
         tgt_face = max(tgt_faces, key=lambda f: f["score"])
 
@@ -267,7 +284,7 @@ def apply_face_lock_to_video(
     try:
         src_pil = Image.open(io.BytesIO(user_photo_bytes)).convert("RGB")
         src_bgr = cv2.cvtColor(np.array(src_pil), cv2.COLOR_RGB2BGR)
-        src_faces = detect_faces(src_bgr)
+        src_faces = detect_faces(src_bgr, score_threshold=0.3)
 
         if not src_faces:
             logger.warning("No face detected in user photo for video face locking.")
@@ -295,18 +312,18 @@ def apply_face_lock_to_video(
 
         # Temporal smoothing buffer for target face landmarks
         prev_landmarks = None
-        smoothing_alpha = 0.7  # 70% current frame, 30% previous frame for stability
+        smoothing_alpha = 0.75  # 75% current frame, 25% previous frame for stability
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            tgt_faces = detect_faces(frame)
+            tgt_faces = detect_faces(frame, score_threshold=0.2)
             if tgt_faces:
                 tgt_face = max(tgt_faces, key=lambda f: f["score"])
                 if prev_landmarks is not None:
-                    # Smooth landmarks
+                    # Smooth landmarks across frames
                     tgt_face["landmarks"] = (
                         smoothing_alpha * tgt_face["landmarks"]
                         + (1.0 - smoothing_alpha) * prev_landmarks

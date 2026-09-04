@@ -176,8 +176,29 @@ def video_generate(
             state = tool_context._invocation_context.session.state
             user_photo_gcs = state.get("user_photo_gcs_uri")
             user_photo_uri = state.get("user_photo_uri")
-            user_photo_bytes = None
 
+            if not user_photo_gcs and not user_photo_uri:
+                # Scan conversation history for photo references
+                try:
+                    events = tool_context._invocation_context.session.events
+                    for event in reversed(events):
+                        if event.content and event.content.parts:
+                            for part in event.content.parts:
+                                if part.text:
+                                    match = re.search(
+                                        r"(https?://\S+\.(?:png|jpe?g|webp)|gs://\S+\.(?:png|jpe?g|webp)|/[^\s'\"<>]+\.(?:png|jpe?g|webp)|[a-zA-Z0-9_\-./]+\.(?:png|jpe?g|webp))",
+                                        part.text,
+                                        re.IGNORECASE,
+                                    )
+                                    if match:
+                                        found_uri = match.group(1).strip("'\")")
+                                        if os.path.exists(found_uri) or found_uri.startswith("http") or found_uri.startswith("gs://"):
+                                            user_photo_uri = found_uri
+                                            break
+                except Exception as ex:
+                    logger.debug(f"Video agent event scan error: {ex}")
+
+            user_photo_bytes = None
             if user_photo_gcs:
                 user_photo_bytes = _load_image_bytes(user_photo_gcs, project_id, bucket_name)
             elif user_photo_uri:

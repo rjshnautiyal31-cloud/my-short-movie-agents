@@ -36,8 +36,17 @@ logger.setLevel(logging.DEBUG)
 MODEL = "gemini-2.5-flash"
 IMAGE_MODEL = "gemini-2.5-flash-image"
 DESCRIPTION = (
-    "Agent responsible for creating consistent character reference sheets and "
-    "scene storyboards with exact face preservation based on user photos."
+    "Agent responsible for creating unified cinematic master character sheets and "
+    "consistent scene storyboards with exact face locking from user photos."
+)
+
+DEFAULT_CINEMATIC_STYLE = (
+    "High-End Cinematic Live-Action Feature Film, 8k resolution, crisp photorealistic details, "
+    "realistic human skin and clothing textures, volumetric cinema lighting."
+)
+STRICT_NEGATIVE_PROMPT = (
+    "STRICT AVOID / NEGATIVE CONSTRAINTS: Absolutely NO pencil sketch, NO rough drawing, "
+    "NO 2D cartoon, NO black and white line art, NO caricature, NO watermarks, NO storyboard text borders."
 )
 
 
@@ -96,11 +105,42 @@ def _load_image_part(
     return None
 
 
+def _find_user_photo_in_session(tool_context: ToolContext) -> str:
+    """Finds any user photo URI in session state or message events."""
+    try:
+        state = tool_context._invocation_context.session.state
+        if state.get("user_photo_gcs_uri"):
+            return str(state["user_photo_gcs_uri"])
+        if state.get("user_photo_uri"):
+            return str(state["user_photo_uri"])
+
+        # Scan session events
+        events = tool_context._invocation_context.session.events
+        for event in reversed(events):
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        match = re.search(
+                            r"(https?://\S+\.(?:png|jpe?g|webp)|gs://\S+\.(?:png|jpe?g|webp)|/[^\s'\"<>]+\.(?:png|jpe?g|webp)|[a-zA-Z0-9_\-./]+\.(?:png|jpe?g|webp))",
+                            part.text,
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            uri = match.group(1).strip("'\")")
+                            if os.path.exists(uri) or uri.startswith("http") or uri.startswith("gs://"):
+                                state["user_photo_uri"] = uri
+                                logger.info(f"Auto-discovered user photo URI from conversation: {uri}")
+                                return uri
+    except Exception as e:
+        logger.debug(f"Event scan error: {e}")
+    return ""
+
+
 def create_character_profile(
     character_name: str,
     visual_description: str,
     photo_path_or_url: str = "",
-    visual_style: str = "Cinematic 3D Animation, vibrant cinematic lighting, cohesive aesthetic",
+    visual_style: str = "",
     tool_context: ToolContext = None,  # type: ignore[assignment]
 ) -> str:
     """Create a Master Character Reference Sheet from a description or user photo.
@@ -113,7 +153,7 @@ def create_character_profile(
         visual_description (str): Detailed visual traits, clothing, colors, and distinct features.
         photo_path_or_url (str): Optional local file path (e.g. 'me.jpg') or URL/GCS link to
           a reference photo (e.g. photo of the user) to base the character on.
-        visual_style (str): The unified art style (e.g., 'Cinematic 3D Animation', 'Photorealistic').
+        visual_style (str): The unified art style. Defaults to photorealistic cinematic film.
         tool_context (ToolContext): ADK runtime tool context.
 
     Returns:
@@ -132,9 +172,20 @@ def create_character_profile(
             location=location,
         )
 
+        state = tool_context._invocation_context.session.state
         clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", character_name.lower())
+
+        # Resolve photo URI if not explicitly passed
+        if not photo_path_or_url:
+            photo_path_or_url = _find_user_photo_in_session(tool_context)
+
+        # Unify visual style
+        if not visual_style:
+            visual_style = state.get("visual_style", DEFAULT_CINEMATIC_STYLE)
+        state["visual_style"] = visual_style
+
         logger.info(
-            f"Creating character reference profile for '{character_name}' (photo: {photo_path_or_url})"
+            f"Creating character reference profile for '{character_name}' (photo: {photo_path_or_url}, style: {visual_style})"
         )
 
         contents: list[Any] = []
@@ -150,7 +201,6 @@ def create_character_profile(
             photo_blob.upload_from_string(user_photo_bytes, content_type="image/png")
             user_photo_gcs = f"gs://{bucket_name}/{session_id}/user_photo.png"
 
-            state = tool_context._invocation_context.session.state
             state["user_photo_gcs_uri"] = user_photo_gcs
             state["user_photo_uri"] = photo_path_or_url
 
@@ -160,20 +210,22 @@ def create_character_profile(
                 f"[REFERENCE PHOTO ATTACHED FOR CHARACTER '{character_name}']"
             )
             prompt = (
-                f"Create a unified master character sheet for character '{character_name}'.\n"
-                f"Art Style: {visual_style}.\n"
-                f"Instructions:\n"
-                f"1. Accurately capture the person's real facial structure, hairstyle, eyes, and distinct likeness from the attached photo.\n"
-                f"2. Seamlessly adapt their likeness into the {visual_style} aesthetic so it looks completely organic.\n"
+                f"Create a high-resolution Master Character Reference Profile for character '{character_name}'.\n"
+                f"GLOBAL ART STYLE: {visual_style}.\n"
+                f"MANDATORY INSTRUCTIONS:\n"
+                f"1. Accurately capture the person's exact facial structure, eyes, nose, hairstyle, and likeness from the attached reference photo.\n"
+                f"2. Seamlessly render the character in full cinematic photographic realism matching the global film style.\n"
                 f"3. Character costume and attributes: {visual_description}.\n"
-                f"4. Render full-body and 3/4 front views on a clean studio background with consistent lighting and colors."
+                f"4. Render full-body and 3/4 front views on a clean studio background with consistent lighting and colors.\n"
+                f"{STRICT_NEGATIVE_PROMPT}"
             )
         else:
             prompt = (
-                f"Create a master character sheet illustration for character '{character_name}'.\n"
-                f"Art Style: {visual_style}.\n"
+                f"Create a high-resolution Master Character Reference Profile for character '{character_name}'.\n"
+                f"GLOBAL ART STYLE: {visual_style}.\n"
                 f"Character Visual Details: {visual_description}.\n"
-                f"Render full-body and 3/4 front views on a clean studio background with clear, consistent color palette and features."
+                f"Render full-body and 3/4 front views on a clean studio background with consistent lighting and colors.\n"
+                f"{STRICT_NEGATIVE_PROMPT}"
             )
 
         contents.append(prompt)
@@ -194,7 +246,7 @@ def create_character_profile(
                     break
 
         if image_bytes:
-            # Composite user's exact face onto the generated character sheet
+            # Composite user's exact face onto the master character profile
             if user_photo_bytes:
                 image_bytes = composite_face_into_image_bytes(image_bytes, user_photo_bytes)
 
@@ -207,7 +259,6 @@ def create_character_profile(
             gcs_uri = f"gs://{bucket_name}/{blob_path}"
 
             # Save in session state for subsequent scene storyboards
-            state = tool_context._invocation_context.session.state
             char_refs = state.get("character_refs", {})
             char_refs[clean_name] = gcs_uri
             state["character_refs"] = char_refs
@@ -246,9 +297,12 @@ def storyboard_generate(
         project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
         location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
         authorized_uri = "https://storage.mtls.cloud.google.com/"
+        state = tool_context._invocation_context.session.state
+
+        visual_style = state.get("visual_style", DEFAULT_CINEMATIC_STYLE)
 
         logger.info(
-            f"Generating storyboard for scene {scene_number} with prompt: {prompt}"
+            f"Generating storyboard for scene {scene_number} (style: {visual_style}) with prompt: {prompt}"
         )
 
         client = genai.Client(
@@ -264,7 +318,6 @@ def storyboard_generate(
         if character_reference_link:
             char_ref_dict["character"] = character_reference_link
         else:
-            state = tool_context._invocation_context.session.state
             stored_refs = state.get("character_refs", {})
             if isinstance(stored_refs, dict):
                 char_ref_dict = stored_refs
@@ -274,24 +327,19 @@ def storyboard_generate(
             if part:
                 contents.append(part)
                 contents.append(
-                    f"[REFERENCE SHEET FOR CHARACTER: '{char_name.upper()}']"
+                    f"[MASTER CHARACTER REFERENCE SHEET FOR: '{char_name.upper()}']"
                 )
 
-        if char_ref_dict:
-            scene_text = (
-                f"SCENE {scene_number} STORYBOARD GENERATION:\n"
-                f"CRITICAL RULES:\n"
-                f"1. For each character appearing in this scene, strictly match their appearance, face, hair, clothing, and colors from their respective attached reference sheet.\n"
-                f"2. DO NOT mix up or swap traits between characters.\n"
-                f"3. Render the entire scene in full, cohesive cinematic color and lighting matching the movie's style.\n\n"
-                f"Scene Action & Environment:\n{prompt}"
-            )
-        else:
-            scene_text = (
-                f"SCENE {scene_number} STORYBOARD GENERATION:\n"
-                f"Render the scene in full cinematic color, dynamic composition, and consistent lighting.\n\n"
-                f"Scene Action & Environment:\n{prompt}"
-            )
+        scene_text = (
+            f"SCENE {scene_number} CINEMATIC VISUALIZATION:\n"
+            f"GLOBAL ART STYLE: {visual_style}\n\n"
+            f"MANDATORY RULES:\n"
+            f"1. RENDER QUALITY: Render this entire scene in full, vibrant, high-fidelity cinematic realism matching the global art style.\n"
+            f"2. CHARACTER CONSISTENCY: For every character present, strictly match the exact facial structure, hair, clothing, and palette from their attached reference sheet.\n"
+            f"3. COHESIVE LIGHTING: Match the natural environmental lighting and camera lens of a blockbuster movie.\n"
+            f"{STRICT_NEGATIVE_PROMPT}\n\n"
+            f"Scene Action & Environment:\n{prompt}"
+        )
 
         contents.append(scene_text)
 
@@ -312,16 +360,17 @@ def storyboard_generate(
 
         if image_bytes:
             # Check for user photo face compositing to lock exact face on Frame 0
-            state = tool_context._invocation_context.session.state
             user_photo_gcs = state.get("user_photo_gcs_uri")
-            user_photo_uri = state.get("user_photo_uri")
+            user_photo_uri = state.get("user_photo_uri") or _find_user_photo_in_session(tool_context)
             user_photo_bytes = None
+
             if user_photo_gcs:
                 user_photo_bytes = _load_image_bytes(user_photo_gcs, project_id, bucket_name)
             elif user_photo_uri:
                 user_photo_bytes = _load_image_bytes(user_photo_uri, project_id, bucket_name)
 
             if user_photo_bytes:
+                logger.info(f"Compositing user exact face onto Scene {scene_number} storyboard frame")
                 image_bytes = composite_face_into_image_bytes(image_bytes, user_photo_bytes)
 
             storage_client = storage.Client(project=project_id)
