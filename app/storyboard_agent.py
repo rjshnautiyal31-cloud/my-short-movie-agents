@@ -107,7 +107,7 @@ def create_character_profile(
         clean_name = re.sub(r"[^a-zA-Z0-9_]", "_", character_name.lower())
 
         # Resolve user photo bytes across all modalities
-        user_photo_bytes, resolved_uri = _resolve_user_photo_bytes_and_uri(
+        user_photo_bytes, resolved_uri = resolve_user_photo_bytes_and_uri(
             tool_context, photo_path_or_url
         )
 
