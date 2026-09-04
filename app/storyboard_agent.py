@@ -25,6 +25,7 @@ from google.adk.tools import ToolContext
 from google.cloud import storage
 from google.genai import types
 
+from .utils.face_lock import composite_face_into_image_bytes
 from .utils.utils import load_prompt_from_file
 
 # Set logging
@@ -36,19 +37,18 @@ MODEL = "gemini-2.5-flash"
 IMAGE_MODEL = "gemini-2.5-flash-image"
 DESCRIPTION = (
     "Agent responsible for creating consistent character reference sheets and "
-    "scene storyboards based on a screenplay, story, and optional user photos."
+    "scene storyboards with exact face preservation based on user photos."
 )
 
 
-def _load_image_part(
+def _load_image_bytes(
     path_or_uri: str, project_id: str, bucket_name: str
-) -> types.Part | None:
-    """Helper to load an image from a local file path, GCS URI, or HTTPS URL as a genai Part."""
+) -> bytes | None:
+    """Helper to load raw image bytes from local file path, GCS URI, or HTTP URL."""
     if not path_or_uri:
         return None
 
     try:
-        # Standardize URI
         normalized = path_or_uri.strip()
         authorized_uri = "https://storage.mtls.cloud.google.com/"
 
@@ -61,31 +61,38 @@ def _load_image_part(
         if normalized.startswith("gs://"):
             storage_client = storage.Client(project=project_id)
             blob = storage.Blob.from_string(normalized, client=storage_client)
-            img_bytes = blob.download_as_bytes()
-            mime = blob.content_type or "image/png"
-            return types.Part.from_bytes(data=img_bytes, mime_type=mime)
+            return blob.download_as_bytes()
 
         # Case 2: Local file path
         if os.path.exists(normalized):
             with open(normalized, "rb") as f:
-                img_bytes = f.read()
-            mime, _ = mimetypes.guess_type(normalized)
-            mime = mime or "image/jpeg"
-            return types.Part.from_bytes(data=img_bytes, mime_type=mime)
+                return f.read()
 
         # Case 3: Public HTTP/HTTPS URL
         if normalized.startswith("http://") or normalized.startswith("https://"):
+            ctx = urllib.request.ssl._create_unverified_context()
             req = urllib.request.Request(
                 normalized, headers={"User-Agent": "Mozilla/5.0"}
             )
-            with urllib.request.urlopen(req) as resp:
-                img_bytes = resp.read()
-            mime = resp.headers.get_content_type() or "image/jpeg"
-            return types.Part.from_bytes(data=img_bytes, mime_type=mime)
+            with urllib.request.urlopen(req, context=ctx) as resp:
+                return resp.read()
 
     except Exception as e:
-        logger.warning(f"Could not load reference image from '{path_or_uri}': {e}")
+        logger.warning(f"Could not load image bytes from '{path_or_uri}': {e}")
 
+    return None
+
+
+def _load_image_part(
+    path_or_uri: str, project_id: str, bucket_name: str
+) -> types.Part | None:
+    """Helper to load an image as a genai Part."""
+    img_bytes = _load_image_bytes(path_or_uri, project_id, bucket_name)
+    if img_bytes:
+        mime = "image/png"
+        if path_or_uri.lower().endswith(".jpg") or path_or_uri.lower().endswith(".jpeg"):
+            mime = "image/jpeg"
+        return types.Part.from_bytes(data=img_bytes, mime_type=mime)
     return None
 
 
@@ -131,11 +138,23 @@ def create_character_profile(
         )
 
         contents: list[Any] = []
-        photo_part = None
+        user_photo_bytes = None
         if photo_path_or_url:
-            photo_part = _load_image_part(photo_path_or_url, project_id, bucket_name)
+            user_photo_bytes = _load_image_bytes(photo_path_or_url, project_id, bucket_name)
 
-        if photo_part:
+        if user_photo_bytes:
+            # Save raw user photo to GCS for downstream face locking
+            storage_client = storage.Client(project=project_id)
+            bucket = storage_client.bucket(bucket_name)
+            photo_blob = bucket.blob(f"{session_id}/user_photo.png")
+            photo_blob.upload_from_string(user_photo_bytes, content_type="image/png")
+            user_photo_gcs = f"gs://{bucket_name}/{session_id}/user_photo.png"
+
+            state = tool_context._invocation_context.session.state
+            state["user_photo_gcs_uri"] = user_photo_gcs
+            state["user_photo_uri"] = photo_path_or_url
+
+            photo_part = types.Part.from_bytes(data=user_photo_bytes, mime_type="image/png")
             contents.append(photo_part)
             contents.append(
                 f"[REFERENCE PHOTO ATTACHED FOR CHARACTER '{character_name}']"
@@ -145,7 +164,7 @@ def create_character_profile(
                 f"Art Style: {visual_style}.\n"
                 f"Instructions:\n"
                 f"1. Accurately capture the person's real facial structure, hairstyle, eyes, and distinct likeness from the attached photo.\n"
-                f"2. Seamlessly adapt their likeness into the {visual_style} aesthetic so it looks completely organic (not a cutout or collage).\n"
+                f"2. Seamlessly adapt their likeness into the {visual_style} aesthetic so it looks completely organic.\n"
                 f"3. Character costume and attributes: {visual_description}.\n"
                 f"4. Render full-body and 3/4 front views on a clean studio background with consistent lighting and colors."
             )
@@ -175,6 +194,10 @@ def create_character_profile(
                     break
 
         if image_bytes:
+            # Composite user's exact face onto the generated character sheet
+            if user_photo_bytes:
+                image_bytes = composite_face_into_image_bytes(image_bytes, user_photo_bytes)
+
             storage_client = storage.Client(project=project_id)
             bucket = storage_client.bucket(bucket_name)
             blob_path = f"{session_id}/character_{clean_name}.png"
@@ -288,6 +311,19 @@ def storyboard_generate(
                     break
 
         if image_bytes:
+            # Check for user photo face compositing to lock exact face on Frame 0
+            state = tool_context._invocation_context.session.state
+            user_photo_gcs = state.get("user_photo_gcs_uri")
+            user_photo_uri = state.get("user_photo_uri")
+            user_photo_bytes = None
+            if user_photo_gcs:
+                user_photo_bytes = _load_image_bytes(user_photo_gcs, project_id, bucket_name)
+            elif user_photo_uri:
+                user_photo_bytes = _load_image_bytes(user_photo_uri, project_id, bucket_name)
+
+            if user_photo_bytes:
+                image_bytes = composite_face_into_image_bytes(image_bytes, user_photo_bytes)
+
             storage_client = storage.Client(project=project_id)
             bucket = storage_client.bucket(bucket_name)
             blob_path = f"{session_id}/scene_{scene_number}.png"

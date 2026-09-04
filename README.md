@@ -45,8 +45,10 @@ The system is coordinated by a **Director Agent** that orchestrates specialized 
 * **Image-to-Image Conditioning**: Gemini 2.5 Flash Image uses the master character anchors across all scene storyboards.
 * **Image-to-Video (I2V) Animation**: Veo 3.1 directly takes the generated scene storyboard as visual input, preventing character drift across video scenes.
 
-### 3. "Self-as-Character" (Photo Upload Support)
-* Provide a path or URL to your photo (e.g. `me.jpg`), and the Storyboard Agent will stylize you into the movie's main protagonist while preserving your facial features, hairstyle, and likeness across every scene.
+### 3. Exact Face Preservation ("Self-as-Character" Hybrid Pipeline)
+* **Direct Photo Composition (Storyboard Stage)**: Seamlessly composites your real, high-resolution face onto the character's body in scene storyboards using landmark detection, Reinhard color/lighting transfer, and Poisson blending.
+* **Image-to-Video Animation (Veo 3.1)**: Veo uses the photo-anchored storyboard as Frame 0, animating the character with authentic facial likeness.
+* **Post-Processing Video Face-Lock**: Automatically tracks and refines facial landmarks across all video frames with temporal smoothing to guarantee a **100% exact facial identity** across every scene.
 
 ---
 
